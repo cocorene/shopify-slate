@@ -7,7 +7,7 @@
 const argv = require('minimist')(process.argv.slice(2));
 const figures = require('figures');
 const chalk = require('chalk');
-const createHash = require('crypto').createHash;
+const {createHash} = require('crypto');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -21,7 +21,9 @@ const openBrowser = require('react-dev-utils/openBrowser');
 const clearConsole = require('react-dev-utils/clearConsole');
 const formatWebpackMessages = require('react-dev-utils/formatWebpackMessages');
 const {event} = require('@shopify/slate-analytics');
-const {sync, promptIfPublishedTheme} = require('@shopify/slate-sync');
+const {sync} = require('@shopify/slate-sync');
+const continueIfPublishedTheme = require('../prompts/continue-if-published-theme');
+const skipSettingsData = require('../prompts/skip-settings-data');
 const slateEnv = require('@shopify/slate-env');
 
 const config = require('../../slate-tools.config');
@@ -32,8 +34,8 @@ const packageJson = require('../../package.json');
 event('slate-tools:start:start', {version: packageJson.version, webpackConfig});
 
 setEnvironment(argv.env);
-
 clearConsole();
+
 let spinner = ora(chalk.magenta(' Compiling...')).start();
 
 const sslCert = fs.existsSync(config.paths.ssl.cert)
@@ -53,8 +55,7 @@ const app = express();
 const server = https.createServer(sslOptions, app);
 const compiler = webpack(webpackConfig);
 
-const shopifyUrl = `https://${slateEnv.getStoreValue()}`;
-const previewUrl = `${shopifyUrl}?preview_theme_id=${slateEnv.getThemeIdValue()}`;
+const previewUrl = `https://${slateEnv.getStoreValue()}?preview_theme_id=${slateEnv.getThemeIdValue()}`;
 
 let isFirstCompilation = true;
 let isFirstDeploy = true;
@@ -132,9 +133,92 @@ compiler.plugin('done', async stats => {
   spinner.stop();
   clearConsole();
 
-  // webpack messages massaging and logging gracioulsy provided by create-react-app.
+  _handleCompileMessages(stats);
+
+  const files = getFilesFromAssets(stats);
+
+  if (!files.length) {
+    return;
+  }
+
+  // files.forEach(file => {
+  //   console.log(`\t${file}`);
+  // });
+  // console.log('\n');
+
+  const liquidFiles = files.filter(file => path.extname(file) === '.liquid');
+
+  if (isFirstCompilation && argv.skipFirstDeploy) {
+    event('slate-tools:start:skip-first-deploy', {
+      version: packageJson.version,
+    });
+
+    console.log(
+      `\n${chalk.blue(
+        figures.info,
+      )}  Skipping first deployment because --skipFirstDeploy flag`,
+    );
+
+    console.log(chalk.magenta('\nWatching for changes...'));
+
+    isFirstCompilation = false;
+    return openBrowser(previewUrl);
+  }
+
+  let skipSettingsData;
+
+  if (isFirstDeploy) {
+    if (!await continueIfPublishedTheme()) {
+      process.exit(0);
+    }
+
+    skipSettingsData = await promptSkipSettingsData(files);
+    isFirstDeploy = false;
+  }
+
+  if (skipSettingsData) {
+    files = files.filter(file => !file.endsWith('settings_data.json'));
+  }
+
+  try {
+    event('slate-tools:start:sync-start', {version: packageJson.version});
+    await sync(files);
+    event('slate-tools:start:sync-end', {version: packageJson.version});
+
+    process.stdout.write(consoleControl.previousLine(4));
+    process.stdout.write(consoleControl.eraseData());
+
+    console.log(
+      `\n${chalk.green(
+        figures.tick,
+      )}  Files uploaded successfully! Your theme is running at:\n`,
+    );
+    console.log(`      ${chalk.cyan(previewUrl)}`);
+    console.log(chalk.magenta('\nWatching for changes...'));
+
+    if (isFirstCompilation) {
+      isFirstCompilation = false;
+      openBrowser(previewUrl);
+    }
+
+    // Notify the HMR client that we finished uploading files to Shopify
+    return hotMiddleware.publish({
+      action: 'shopify_upload_finished',
+      force: liquidFiles.length > 0,
+    });
+  } catch (error) {
+    event('slate-tools:start:sync-error', {
+      error,
+      version: packageJson.version,
+    });
+
+    console.log(chalk.red(error));
+    process.exit(0);
+  }
+});
+
+function _handleCompileMessages(stats) {
   const statsJson = stats.toJson({}, true);
-  const time = statsJson.time / 1000;
   const messages = formatWebpackMessages(statsJson);
 
   if (messages.errors.length) {
@@ -169,81 +253,10 @@ compiler.plugin('done', async stats => {
       version: packageJson.version,
     });
     console.log(
-      `${chalk.green(figures.tick)}  Compiled successfully in ${time}s!`,
+      `${chalk.green(figures.tick)}  Compiled successfully in ${statsJson.time /
+        1000}s!`,
     );
   }
-
-  // files we'll upload
-  const files = getFilesFromAssets(stats);
-
-  if (!files.length) {
-    return;
-  }
-
-  // files.forEach(file => {
-  //   console.log(`\t${file}`);
-  // });
-  // console.log('\n');
-
-  const liquidFiles = files.filter(file => path.extname(file) === '.liquid');
-
-  if (isFirstCompilation && argv.skipFirstDeploy) {
-    isFirstCompilation = false;
-    openBrowser(previewUrl);
-
-    event('slate-tools:start:skip-first-deploy', {
-      version: packageJson.version,
-    });
-
-    console.log(
-      `\n${chalk.blue(
-        figures.info,
-      )}  Skipping first deployment because --skipFirstDeploy flag`,
-    );
-
-    console.log(chalk.magenta('\nWatching for changes...'));
-  } else {
-    if (isFirstDeploy) {
-      await promptIfPublishedTheme().catch(() => process.exit(0));
-      isFirstDeploy = false;
-    }
-
-    event('slate-tools:start:sync-start', {version: packageJson.version});
-
-    sync(files)
-      .then(() => {
-        event('slate-tools:start:sync-end', {version: packageJson.version});
-
-        process.stdout.write(consoleControl.previousLine(4));
-        process.stdout.write(consoleControl.eraseData());
-        console.log(
-          `\n${chalk.green(
-            figures.tick,
-          )}  Files uploaded successfully! Your theme is running at:\n`,
-        );
-        console.log(`      ${chalk.cyan(previewUrl)}`);
-
-        console.log(chalk.magenta('\nWatching for changes...'));
-
-        if (isFirstCompilation) {
-          isFirstCompilation = false;
-          openBrowser(previewUrl);
-        }
-
-        // Notify the HMR client that we finished uploading files to Shopify
-        return hotMiddleware.publish({
-          action: 'shopify_upload_finished',
-          force: liquidFiles.length > 0,
-        });
-      })
-      .catch(error => {
-        event('slate-tools:start:sync-error', {
-          error,
-          version: packageJson.version,
-        });
-        console.log(chalk.red(error));
-      });
-  }
-});
+}
 
 server.listen(config.port);
